@@ -1,0 +1,54 @@
+# Core Django Framework
+Django==5.2.6
+djangorestframework==3.16.1
+asgiref==3.9.1
+sqlparse==0.5.3
+tzdata==2025.2
+
+# JWT Authentication
+djangorestframework-simplejwt==5.5.1
+PyJWT==2.10.1
+
+# Database
+mysqlclient==2.2.7
+# Alternative for PostgreSQL (uncomment if using PostgreSQL)
+# psycopg2-binary==2.9.9
+
+# CORS Headers for API access (currently disabled in settings)
+django-cors-headers==4.3.1
+
+# Image Processing (for potential image fields)
+Pillow==10.4.0
+
+# SMS and WhatsApp OTP Services
+twilio==9.2.4
+
+# Email Support
+# Gmail SMTP is used by default via Django's built-in email backend
+
+# Environment Variables Management
+python-decouple==3.8
+
+# HTTP Requests (if needed for external API calls)
+requests==2.32.3  # Updated for AI app compatibility
+
+# Development and Testing
+# Uncomment for development
+# django-debug-toolbar==4.4.6
+# django-extensions==3.2.3
+
+# Production Dependencies
+gunicorn==21.2.0
+whitenoise==6.7.0
+
+# Background Tasks (if needed)
+# Uncomment if using Celery for background tasks
+# celery==5.5.3
+# redis==6.4.0
+# django-celery-beat==2.8.1
+
+# Additional Development Tools
+# Uncomment as needed
+# django-filter==25.1  # For advanced filtering
+# django-environ==0.12.0  # Alternative to python-decouple
+# validate-email==1.3  # For email validation

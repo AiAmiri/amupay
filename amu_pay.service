@@ -1,0 +1,31 @@
+[Unit]
+Description=AMU Pay Django Application
+After=network.target
+
+[Service]
+Type=notify
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/amu_pay
+Environment="PATH=/home/ubuntu/amu_pay/venv/bin"
+ExecStart=/home/ubuntu/amu_pay/venv/bin/gunicorn \
+    --config /home/ubuntu/amu_pay/gunicorn_config.py \
+    amu_pay.wsgi:application
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=10
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/amu_pay
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=amu_pay
+
+[Install]
+WantedBy=multi-user.target
+
