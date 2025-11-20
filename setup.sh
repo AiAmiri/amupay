@@ -38,7 +38,7 @@ fi
 APP_DIR="/home/ubuntu/amu_pay"
 echo "Creating application directory at $APP_DIR..."
 mkdir -p $APP_DIR
-cd $APP_DIR
+cd $APP_DIR/amu_pay || cd $APP_DIR
 
 # Create virtual environment
 echo "Creating Python virtual environment..."
@@ -51,7 +51,14 @@ pip install --upgrade pip
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-pip install -r requirements.txt
+if [ -f "amu_pay/requirements.txt" ]; then
+    pip install -r amu_pay/requirements.txt
+elif [ -f "requirements.txt" ]; then
+    pip install -r requirements.txt
+else
+    echo "Error: requirements.txt not found!"
+    exit 1
+fi
 
 # Create necessary directories
 echo "Creating necessary directories..."

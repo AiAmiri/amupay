@@ -9,7 +9,7 @@ echo "========================================="
 echo "AMU Pay Deployment"
 echo "========================================="
 
-APP_DIR="/home/ubuntu/amu_pay"
+APP_DIR="/home/ubuntu/amu_pay/amu_pay"
 cd $APP_DIR
 
 # Activate virtual environment
@@ -23,7 +23,7 @@ source venv/bin/activate
 # Install/update dependencies
 echo "Installing/updating dependencies..."
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r ../requirements.txt || pip install -r requirements.txt
 
 # Run database migrations
 echo "Running database migrations..."

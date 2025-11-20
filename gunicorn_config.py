@@ -14,8 +14,9 @@ timeout = 120
 keepalive = 5
 
 # Logging
-accesslog = "/var/log/gunicorn/access.log"
-errorlog = "/var/log/gunicorn/error.log"
+# Use relative paths or journald (systemd will handle logging)
+accesslog = "-"  # Log to stdout (captured by systemd)
+errorlog = "-"   # Log to stderr (captured by systemd)
 loglevel = "info"
 access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
 
@@ -24,7 +25,7 @@ proc_name = "amu_pay"
 
 # Server mechanics
 daemon = False
-pidfile = "/var/run/gunicorn/pid"
+# pidfile = "/var/run/gunicorn/pid"  # Commented out - systemd manages PID
 umask = 0
 user = None
 group = None

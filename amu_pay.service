@@ -6,8 +6,9 @@ After=network.target
 Type=notify
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/amu_pay
+WorkingDirectory=/home/ubuntu/amu_pay/amu_pay
 Environment="PATH=/home/ubuntu/amu_pay/venv/bin"
+EnvironmentFile=/home/ubuntu/amu_pay/.env
 ExecStart=/home/ubuntu/amu_pay/venv/bin/gunicorn \
     --config /home/ubuntu/amu_pay/gunicorn_config.py \
     amu_pay.wsgi:application
@@ -19,7 +20,7 @@ RestartSec=10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/home/ubuntu/amu_pay
+ReadWritePaths=/home/ubuntu/amu_pay/amu_pay
 
 # Logging
 StandardOutput=journal
