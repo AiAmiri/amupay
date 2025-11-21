@@ -7,8 +7,35 @@ from rest_framework_simplejwt.views import (
     TokenObtainPairView,
 )
 from saraf_account.views import CustomTokenRefreshView
+from django.http import JsonResponse
+import os
+
+# Temporary debug view to inspect storage backend and env vars
+
+def debug_s3(request):
+    from django.core.files.storage import default_storage
+    from django.utils.module_loading import import_string
+    error = None
+    try:
+        cls_path = settings.DEFAULT_FILE_STORAGE
+        cls = import_string(cls_path)
+        _ = cls()  # instantiate to trigger any S3 errors
+    except Exception as e:
+        error = str(e)
+
+    data = {
+        "DEFAULT_FILE_STORAGE": settings.DEFAULT_FILE_STORAGE,
+        "storage_class": str(default_storage.__class__),
+        "USE_S3_env": os.getenv("USE_S3"),
+        "AWS_STORAGE_BUCKET_NAME_env": os.getenv("AWS_STORAGE_BUCKET_NAME"),
+        "media_storage_error": error,
+    }
+    return JsonResponse(data)
+
 
 urlpatterns = [
+    # Debug endpoint (remove in production)
+    path('debug-s3/', debug_s3),
     path('admin/', admin.site.urls),
 
     # JWT Authentication endpoints
@@ -59,10 +86,14 @@ urlpatterns = [
 
 ]
 
-# Serve media files during development and production
+# Serve static and media files during development
 if settings.DEBUG:
+    # Serve static files (CSS, JS, images) in development
+    from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+    urlpatterns += staticfiles_urlpatterns()
+    # Serve media files (user uploads) in development
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 else:
-    # In production, you should configure your web server (nginx/apache) to serve media files
-    # This is a fallback for development/testing
+    # In production, static files are served by WhiteNoise or nginx
+    # Media files should be served by nginx or S3
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

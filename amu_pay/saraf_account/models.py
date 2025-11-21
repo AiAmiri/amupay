@@ -181,11 +181,39 @@ class SarafAccount(models.Model):
         }
 
     def save(self, *args, **kwargs):
-        """Ensure password is never stored in plain text"""
+        """Ensure password is never stored in plain text and validate AmuPay code"""
+        from django.db import transaction
+        
         if hasattr(self, 'password'):
             delattr(self, 'password')
-        self.full_clean()
-        super().save(*args, **kwargs)
+        
+        # Validate and mark AmuPay code as used for NEW accounts only
+        is_new = self.pk is None
+        if is_new and self.amu_pay_code:
+            # Use transaction to ensure atomicity
+            with transaction.atomic():
+                # Lock the code row to prevent concurrent usage
+                try:
+                    amu_pay_code_obj = AmuPayCode.objects.select_for_update().get(
+                        code=self.amu_pay_code.upper(),
+                        is_used=False
+                    )
+                except AmuPayCode.DoesNotExist:
+                    raise ValidationError(
+                        f"AmuPay code '{self.amu_pay_code}' is invalid or already used. "
+                        "Please use a valid, unused AmuPay code."
+                    )
+                
+                # Save the account first
+                self.full_clean()
+                super().save(*args, **kwargs)
+                
+                # Then mark code as used (atomic operation)
+                amu_pay_code_obj.mark_as_used(self)
+        else:
+            # Existing account or no code - just save normally
+            self.full_clean()
+            super().save(*args, **kwargs)
 
 
 class SarafEmployee(models.Model):
@@ -402,11 +430,28 @@ class AmuPayCode(models.Model):
                 return code
 
     def mark_as_used(self, saraf_account):
-        """Mark this code as used by a specific Saraf account"""
-        self.is_used = True
-        self.used_by = saraf_account
-        self.used_at = timezone.now()
-        self.save()
+        """Mark this code as used by a specific Saraf account - atomic operation"""
+        # Use update() to atomically set is_used and prevent race conditions
+        # This ensures only one request can successfully mark the code as used
+        updated = self.__class__.objects.filter(
+            pk=self.pk,
+            is_used=False  # Only update if still unused
+        ).update(
+            is_used=True,
+            used_by=saraf_account,
+            used_at=timezone.now()
+        )
+        
+        if updated == 0:
+            # Code was already used by another request (race condition detected)
+            # Refresh to get the actual used_by information
+            self.refresh_from_db()
+            raise ValidationError(
+                f"AmuPay code {self.code} was already used by {self.used_by.full_name if self.used_by else 'another registration'}"
+            )
+        
+        # Refresh to get updated values
+        self.refresh_from_db()
 
     @classmethod
     def validate_and_use_code(cls, code):

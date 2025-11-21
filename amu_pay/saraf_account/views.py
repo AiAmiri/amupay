@@ -191,15 +191,6 @@ class SarafAccountRegisterView(APIView):
         if not re.match(r'^0\d{9}$', email_or_whatsapp_number):
             return Response({'error': 'WhatsApp number must be 10 digits and start with 0'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Validate AmuPay code exists and is unused
-        from .models import AmuPayCode
-        try:
-            amu_pay_code_obj = AmuPayCode.objects.get(code=amu_pay_code.upper(), is_used=False)
-        except AmuPayCode.DoesNotExist:
-            return Response({
-                'error': 'Invalid or already used AmuPay code'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
         # Enhanced uniqueness checks - ensure no duplicate accounts
         if SarafAccount.objects.filter(email=email).exists():
             return Response({'error': 'Email already exists.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -232,10 +223,8 @@ class SarafAccountRegisterView(APIView):
             # Set password before first save so that if validation fails, nothing is written
             try:
                 saraf.set_password(password)
+                # Model's save() method will validate and mark AmuPay code as used
                 saraf.save()
-                
-                # Mark AmuPay code as used
-                amu_pay_code_obj.mark_as_used(saraf)
                 
             except ValidationError as ve:
                 # Return model/password validation errors (no partial row persisted)

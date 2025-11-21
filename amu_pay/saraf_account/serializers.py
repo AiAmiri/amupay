@@ -89,16 +89,17 @@ class SarafRegistrationSerializer(serializers.ModelSerializer):
         return value
     
     def validate_amu_pay_code(self, value):
-        """Validate AmuPay code exists and is unused"""
+        """Validate AmuPay code format only - actual usage check happens in create() with transaction"""
         if not value:
             raise serializers.ValidationError("AmuPay code is required")
         
-        # Check if code exists and is unused
-        try:
-            amu_pay_code = AmuPayCode.objects.get(code=value.upper(), is_used=False)
-            return value.upper()  # Return uppercase version
-        except AmuPayCode.DoesNotExist:
-            raise serializers.ValidationError("Invalid or already used AmuPay code")
+        # Only validate format here - actual usage validation happens in create() with row lock
+        # This prevents race conditions where multiple requests pass validation simultaneously
+        value = value.upper().strip()
+        if len(value) != 12:
+            raise serializers.ValidationError("AmuPay code must be 12 characters")
+        
+        return value
     
     def validate(self, data):
         """Validate password match and check duplicates"""
@@ -117,6 +118,9 @@ class SarafRegistrationSerializer(serializers.ModelSerializer):
     
     def create(self, validated_data):
         """Create Saraf account with hashed password"""
+        from django.db import transaction
+        from .models import AmuPayCode
+        
         # Remove fields not needed for model creation
         password = validated_data.pop('password')
         repeat_password = validated_data.pop('repeat_password')
@@ -124,20 +128,28 @@ class SarafRegistrationSerializer(serializers.ModelSerializer):
         # Get the AmuPay code before creating the account
         amu_pay_code_value = validated_data.get('amu_pay_code')
         
-        # Create account
-        saraf_account = SarafAccount.objects.create(**validated_data)
-        
-        # Set password
-        saraf_account.set_password(password)
-        
-        # Mark AmuPay code as used
-        if amu_pay_code_value:
-            try:
-                amu_pay_code = AmuPayCode.objects.get(code=amu_pay_code_value, is_used=False)
+        with transaction.atomic():
+            # Validate and lock AmuPay code INSIDE transaction to prevent race conditions
+            if amu_pay_code_value:
+                try:
+                    # Use select_for_update() to lock the row and prevent concurrent access
+                    amu_pay_code = AmuPayCode.objects.select_for_update().get(
+                        code=amu_pay_code_value.upper(), 
+                        is_used=False
+                    )
+                except AmuPayCode.DoesNotExist:
+                    raise serializers.ValidationError("Invalid or already used AmuPay code")
+            
+            # Create account
+            saraf_account = SarafAccount.objects.create(**validated_data)
+            
+            # Set password
+            saraf_account.set_password(password)
+            saraf_account.save()
+            
+            # Mark AmuPay code as used (inside transaction, with row lock)
+            if amu_pay_code_value:
                 amu_pay_code.mark_as_used(saraf_account)
-            except AmuPayCode.DoesNotExist:
-                # This shouldn't happen due to validation, but handle gracefully
-                pass
         
         return saraf_account
 

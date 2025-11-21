@@ -8,13 +8,13 @@ class SarafAccountAdmin(admin.ModelAdmin):
         'contact_type', 'is_email_verified', 'is_whatsapp_verified', 'license_no', 'is_active', 'created_at'
     )
     list_filter = ('is_active', 'is_email_verified', 'is_whatsapp_verified', 'created_at', 'updated_at')
-    search_fields = ('full_name', 'exchange_name', 'email_or_whatsapp_number', 'license_no', 'amu_pay_code')
+    search_fields = ('full_name', 'exchange_name', 'email', 'email_or_whatsapp_number', 'license_no', 'amu_pay_code')
     ordering = ('-created_at',)
     readonly_fields = ('saraf_id', 'created_at', 'updated_at')
     
     fieldsets = (
         ('Basic Information', {
-            'fields': ('saraf_id', 'full_name', 'exchange_name', 'email_or_whatsapp_number', 'license_no', 'amu_pay_code')
+            'fields': ('saraf_id', 'full_name', 'exchange_name', 'email', 'email_or_whatsapp_number', 'license_no', 'amu_pay_code')
         }),
         ('Address Information', {
             'fields': ('saraf_address', 'province'),
@@ -128,9 +128,8 @@ class AmuPayCodeAdmin(admin.ModelAdmin):
     )
 
     def save_model(self, request, obj, form, change):
-        """Auto-set created_by to current admin user"""
-        if not change:  # Only for new objects
-            obj.created_by = request.user.username
+        """Save model - AmuPay code validation is handled in model's save() method"""
+        # Model's save() method will handle AmuPay code validation and marking
         super().save_model(request, obj, form, change)
 
     def has_delete_permission(self, request, obj=None):

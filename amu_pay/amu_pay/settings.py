@@ -13,10 +13,48 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 import os
 from datetime import timedelta
+
+# --- STORAGE BACKENDS (must be before any Django imports) -------------
+from decouple import config
+USE_S3 = config('USE_S3', default=True, cast=bool)
+USE_S3_FOR_STATIC = config('USE_S3_FOR_STATIC', default=False, cast=bool)
+
+if USE_S3:
+    DEFAULT_FILE_STORAGE = 'amu_pay.storage_backends.MediaStorage'
+    STATICFILES_STORAGE = (
+        'amu_pay.storage_backends.StaticStorage'
+        if USE_S3_FOR_STATIC
+        else 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+    )
+else:
+    DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
+    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+# AWS S3 Configuration (must come BEFORE default_storage rebuild)
+AWS_ACCESS_KEY_ID = config('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = config('AWS_SECRET_ACCESS_KEY')
+AWS_STORAGE_BUCKET_NAME = config('AWS_STORAGE_BUCKET_NAME')
+AWS_S3_REGION_NAME = config('AWS_S3_REGION_NAME', default='eu-north-1')
+AWS_S3_SIGNATURE_VERSION = config('AWS_S3_SIGNATURE_VERSION', default='s3v4')
+AWS_S3_FILE_OVERWRITE = config('AWS_S3_FILE_OVERWRITE', default=False, cast=bool)
+AWS_DEFAULT_ACL = config('AWS_DEFAULT_ACL', default=None)
+AWS_S3_VERIFY = config('AWS_S3_VERIFY', default=True, cast=bool)
+AWS_S3_CUSTOM_DOMAIN = config('AWS_S3_CUSTOM_DOMAIN', default=None)
+
+# Public URL settings for media files when using S3
+MEDIA_URL = f'https://{AWS_STORAGE_BUCKET_NAME}.s3.{AWS_S3_REGION_NAME}.amazonaws.com/media/'
+
+# Force Django to rebuild default_storage with the new backend (AFTER AWS config)
+from django.core.files.storage import default_storage
+from django.utils.module_loading import import_string
+default_storage._wrapped = import_string(DEFAULT_FILE_STORAGE)()
+
+
 from decouple import config, Csv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 
 # Quick-start development settings - unsuitable for production
@@ -89,6 +127,7 @@ INSTALLED_APPS = [
     'user_feedback',
     'rest_framework',
     'rest_framework_simplejwt',
+    'storages',  # AWS S3 storage backend
 
     'django.contrib.admin',
     'django.contrib.auth',
@@ -97,6 +136,8 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
 ]
+
+
 
 MIDDLEWARE = [
     # 'corsheaders.middleware.CorsMiddleware',  # Disabled temporarily
@@ -231,15 +272,13 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'  # For production static files collection
-
-# WhiteNoise configuration for static files
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 # Media files (user uploads)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -313,3 +352,71 @@ PINECONE_API_KEY = config('PINECONE_API_KEY', default=None)
 os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
 GEMINI_API_KEY = config('GEMINI_API_KEY', default=None)
 PINECONE_INDEX_NAME = config('PINECONE_INDEX_NAME', default='amu-pay-docs')
+
+# AWS S3 Configuration (read securely from environment variables)
+AWS_ACCESS_KEY_ID = config('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = config('AWS_SECRET_ACCESS_KEY')
+AWS_STORAGE_BUCKET_NAME = config('AWS_STORAGE_BUCKET_NAME')
+AWS_S3_REGION_NAME = config('AWS_S3_REGION_NAME', default='eu-north-1')
+AWS_S3_SIGNATURE_VERSION = config('AWS_S3_SIGNATURE_VERSION', default='s3v4')
+AWS_S3_FILE_OVERWRITE = config('AWS_S3_FILE_OVERWRITE', default=False, cast=bool)
+AWS_DEFAULT_ACL = config('AWS_DEFAULT_ACL', default=None)
+AWS_S3_VERIFY = config('AWS_S3_VERIFY', default=True, cast=bool)
+AWS_S3_CUSTOM_DOMAIN = config('AWS_S3_CUSTOM_DOMAIN', default=None)
+
+# Public URL settings for media files when using S3
+MEDIA_URL = f'https://{AWS_STORAGE_BUCKET_NAME}.s3.{AWS_S3_REGION_NAME}.amazonaws.com/media/'
+
+# Toggle S3 usage from environment (defaults keep previous behaviour)
+USE_S3 = config('USE_S3', default=True, cast=bool)
+USE_S3_FOR_STATIC = config('USE_S3_FOR_STATIC', default=False, cast=bool)
+
+# Validate AWS credentials when S3 is enabled
+if USE_S3 and (not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY or not AWS_STORAGE_BUCKET_NAME):
+    raise ValueError(
+        "AWS S3 is enabled but credentials or bucket name are missing.\n"
+        "Please set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_STORAGE_BUCKET_NAME in your .env file."
+    )
+
+# Storage backend configuration moved to top of file; duplicate block removed.
+
+# S3 Object Parameters
+AWS_S3_OBJECT_PARAMETERS = {
+    'CacheControl': 'max-age=86400',  # Cache for 1 day
+}
+
+import logging, boto3
+
+# Root logger to DEBUG so our boto3/botocore messages appear in console
+logging.basicConfig(level=logging.DEBUG)
+
+# More verbose output for AWS libraries
+logging.getLogger('boto3').setLevel(logging.DEBUG)
+logging.getLogger('botocore').setLevel(logging.DEBUG)
+
+# Django logging configuration (optional but cleaner)
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'boto3': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'botocore': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'DEBUG',
+    },
+}

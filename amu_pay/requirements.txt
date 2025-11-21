@@ -41,6 +41,10 @@ requests==2.32.3  # Updated for AI app compatibility
 gunicorn==21.2.0
 whitenoise==6.7.0
 
+# AWS S3 Storage
+django-storages==1.14.2
+boto3==1.34.34
+
 # Background Tasks (if needed)
 # Uncomment if using Celery for background tasks
 # celery==5.5.3
