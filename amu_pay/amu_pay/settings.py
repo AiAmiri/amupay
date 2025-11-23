@@ -187,30 +187,65 @@ REST_FRAMEWORK = {
 # }
 
 # Database configuration with SSL support for RDS
-DATABASE_OPTIONS = {
-    'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+# Build database options dynamically
+database_options = {
     'charset': 'utf8mb4',
+    'use_unicode': True,
+    'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
 }
 
-# Add SSL configuration if DB_USE_SSL is enabled
-if config('DB_USE_SSL', default=False, cast=bool):
+# SSL configuration for AWS RDS
+# The issue could be:
+# 1. RDS requires SSL but CA certificate is missing/wrong
+# 2. Code is forcing SSL when RDS doesn't require it
+# 3. Wrong CA certificate path in .env file
+#
+# DIAGNOSTIC: Check your .env file - what is DB_USE_SSL set to?
+# If DB_USE_SSL=True, you MUST have the proper RDS CA bundle
+#
+# SOLUTION OPTIONS:
+# Option A: Disable SSL (if RDS allows it)
+#   In .env: DB_USE_SSL=False
+#
+# Option B: Use proper RDS CA bundle (recommended for production)
+#   On server: wget https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -O /home/ubuntu/rds-ca-bundle.pem
+#   In .env: DB_USE_SSL=True
+#            DB_SSL_CA=/home/ubuntu/rds-ca-bundle.pem
+
+db_use_ssl = config('DB_USE_SSL', default=False, cast=bool)
+
+if db_use_ssl:
     ssl_ca = config('DB_SSL_CA', default=None)
+    
     if ssl_ca and os.path.exists(ssl_ca):
-        DATABASE_OPTIONS['ssl'] = {'ca': ssl_ca}
+        # Use specified CA certificate path
+        database_options['ssl'] = {'ca': ssl_ca}
+        print(f"Using SSL with CA certificate: {ssl_ca}")
+    elif ssl_ca:
+        # CA path specified but file doesn't exist - this is likely the problem!
+        raise FileNotFoundError(
+            f"\n❌ SSL CA certificate file not found: {ssl_ca}\n\n"
+            "This is likely why your migration is failing!\n\n"
+            "SOLUTION: Download the RDS CA bundle:\n"
+            "  cd /home/ubuntu\n"
+            "  wget https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -O rds-ca-bundle.pem\n"
+            "  chmod 644 rds-ca-bundle.pem\n\n"
+            "Then update your .env file:\n"
+            "  DB_SSL_CA=/home/ubuntu/rds-ca-bundle.pem\n\n"
+            "OR disable SSL (if RDS allows it):\n"
+            "  DB_USE_SSL=False\n"
+        )
     else:
-        # Try common CA certificate paths for different Linux distributions
-        ca_paths = [
-            '/etc/ssl/certs/ca-certificates.crt',  # Ubuntu/Debian
-            '/etc/ssl/certs/ca-bundle.crt',  # CentOS/RHEL
-            '/etc/pki/tls/certs/ca-bundle.crt',  # Amazon Linux
-        ]
-        for ca_path in ca_paths:
-            if os.path.exists(ca_path):
-                DATABASE_OPTIONS['ssl'] = {'ca': ca_path}
-                break
-        else:
-            # If no CA certificate found, still try SSL (RDS will handle it)
-            DATABASE_OPTIONS['ssl'] = {}
+        # SSL enabled but no CA provided - this will likely fail
+        print("⚠️  WARNING: DB_USE_SSL=True but no DB_SSL_CA specified!")
+        print("   This will likely cause SSL certificate verification errors.")
+        print("   Either:")
+        print("   1. Set DB_USE_SSL=False in .env, OR")
+        print("   2. Download RDS CA bundle and set DB_SSL_CA")
+        # Try without CA (will likely fail, but let's try)
+        database_options['ssl'] = {}
+else:
+    print("ℹ️  SSL is disabled (DB_USE_SSL=False)")
 
 # Database connection settings
 DATABASES = {
@@ -221,7 +256,7 @@ DATABASES = {
         'PASSWORD': config('DB_PASSWORD', default=''),
         'HOST': config('DB_HOST', default='localhost'),
         'PORT': config('DB_PORT', default='3306'),
-        'OPTIONS': DATABASE_OPTIONS,
+        'OPTIONS': database_options,
         'CONN_MAX_AGE': 600,  # Connection pooling: keep connections alive for 10 minutes
         'AUTOCOMMIT': True,
         'ATOMIC_REQUESTS': False,
