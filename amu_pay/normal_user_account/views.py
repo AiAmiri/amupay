@@ -14,6 +14,8 @@ from django.core.exceptions import ValidationError
 from twilio.rest import Client
 from django.utils import timezone
 from datetime import timedelta
+from django.core.cache import cache
+from django.db import transaction
 import logging
 
 from .models import NormalUser, NormalUserOTP
@@ -149,42 +151,59 @@ class NormalUserRegistrationView(APIView):
     def post(self, request):
         serializer = NormalUserRegistrationSerializer(data=request.data)
         if serializer.is_valid():
-            user = serializer.save()
+            validated_data = serializer.validated_data
             
-            # OTP is ALWAYS sent to email (WhatsApp is for profile only, no OTP)
-            email = user.email
+            # Don't save user yet - store in cache instead
+            email = validated_data['email'].lower()
+            password = validated_data['password']
+            
+            # Validate password by creating a temporary user object
+            try:
+                temp_user = NormalUser(
+                    full_name=validated_data['full_name'],
+                    email=email,
+                    email_or_whatsapp=validated_data['email_or_whatsapp'],
+                )
+                temp_user.set_password(password)
+            except ValidationError as ve:
+                return Response({
+                    'error': 'Validation error',
+                    'details': ve.message_dict if hasattr(ve, 'message_dict') else str(ve)
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Generate OTP code
             otp_code = NormalUserOTP.generate_otp()
             expires_at = timezone.now() + timedelta(minutes=10)
             
-            logger.info(f"Registration: Sending OTP to email: {email}, WhatsApp: {user.email_or_whatsapp}")
+            # Store registration data in cache (NOT in database yet)
+            registration_data = {
+                'full_name': validated_data['full_name'],
+                'email': email,
+                'email_or_whatsapp': validated_data['email_or_whatsapp'],
+                'password_hash': temp_user.password_hash,  # Store hashed password
+                'otp_code': otp_code,
+                'otp_expires_at': expires_at.isoformat(),
+                'created_at': timezone.now().isoformat(),
+            }
+            
+            # Store in cache for 15 minutes (longer than OTP expiration)
+            cache_key = f'normal_user_registration_{email}'
+            cache.set(cache_key, registration_data, 15 * 60)  # 15 minutes
+            
+            logger.info(f"Registration: Sending OTP to email: {email}, WhatsApp: {validated_data['email_or_whatsapp']}")
             
             # Send OTP to email
             if send_otp_email(email, otp_code):
-                # Mark any previous unused OTPs as used
-                NormalUserOTP.objects.filter(
-                    user=user,
-                    otp_type='email',
-                    contact_info=email,
-                    is_used=False
-                ).update(is_used=True, used_at=timezone.now())
-                
-                NormalUserOTP.objects.create(
-                    user=user,
-                    otp_type='email',
-                    contact_info=email,
-                    otp_code=otp_code,
-                    expires_at=expires_at
-                )
-                
                 return Response({
-                    'message': 'Registration successful. Please check your email for OTP verification.',
-                    'user_id': user.user_id,
-                    'email': user.email,
-                    'email_or_whatsapp': user.email_or_whatsapp,
-                    'requires_verification': True
-                }, status=status.HTTP_201_CREATED)
+                    'message': 'Registration data received. Please check your email for OTP verification.',
+                    'email': email,
+                    'email_or_whatsapp': validated_data['email_or_whatsapp'],
+                    'requires_verification': True,
+                    'message_note': 'Your account will be created after OTP verification.'
+                }, status=status.HTTP_200_OK)
             else:
-                user.delete()  # Clean up if email sending fails
+                # Clean up cache if email sending fails
+                cache.delete(cache_key)
                 return Response({
                     'error': 'Failed to send verification email. Please try again.'
                 }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -195,34 +214,117 @@ class NormalUserRegistrationView(APIView):
 class VerifyOTPView(APIView):
     """Verify OTP for normal user registration - Email only"""
     
+    @transaction.atomic
     def post(self, request):
-        serializer = OTPVerificationSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.validated_data['user']
-            otp = serializer.validated_data['otp']
-            
-            # Mark OTP as used
-            otp.mark_as_used()
-            
-            # Update user verification status (Email only)
-            user.is_email_verified = True
-            
-            # Activate the account after successful email verification
-            if not user.is_active:
-                user.is_active = True
-            
-            user.save()
-            
-            return Response({
-                'message': 'Email verification successful! Your account is now active.',
-                'user_id': user.user_id,
-                'email': user.email,
-                'email_or_whatsapp': user.email_or_whatsapp,
-                'is_verified': user.is_verified(),
-                'is_active': user.is_active
-            }, status=status.HTTP_200_OK)
+        email = request.data.get('email', '').strip().lower()
+        otp_code = request.data.get('otp_code', '').strip()
         
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        if not email or not otp_code:
+            return Response({
+                'error': 'email and otp_code are required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if account already exists (shouldn't happen, but check anyway)
+        if NormalUser.objects.filter(email=email).exists():
+            user = NormalUser.objects.get(email=email)
+            # If account exists and is already verified, return success
+            if user.is_email_verified:
+                return Response({
+                    'message': 'Account already verified.',
+                    'user_id': user.user_id,
+                    'email': user.email,
+                    'is_verified': True
+                })
+            # If account exists but not verified, try to verify with existing OTP
+            try:
+                otp = NormalUserOTP.objects.filter(
+                    user=user,
+                    otp_type='email',
+                    contact_info=email,
+                    is_used=False
+                ).latest('created_at')
+                
+                if otp.otp_code == otp_code and not otp.is_expired():
+                    otp.mark_as_used()
+                    user.is_email_verified = True
+                    user.is_active = True
+                    user.save()
+                    return Response({
+                        'message': 'Email verification successful! Your account is now active.',
+                        'user_id': user.user_id,
+                        'email': user.email,
+                        'email_or_whatsapp': user.email_or_whatsapp,
+                        'is_verified': user.is_verified(),
+                        'is_active': user.is_active
+                    }, status=status.HTTP_200_OK)
+            except NormalUserOTP.DoesNotExist:
+                pass
+        
+        # Get registration data from cache
+        cache_key = f'normal_user_registration_{email}'
+        registration_data = cache.get(cache_key)
+        
+        if not registration_data:
+            return Response({
+                'error': 'Registration session expired or not found. Please register again.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Verify OTP code
+        cached_otp = registration_data.get('otp_code')
+        from datetime import datetime
+        cached_expires_at = datetime.fromisoformat(registration_data.get('otp_expires_at'))
+        
+        if cached_otp != otp_code:
+            return Response({
+                'error': 'Invalid OTP code'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if timezone.now() > cached_expires_at:
+            # Clean up expired registration
+            cache.delete(cache_key)
+            return Response({
+                'error': 'OTP expired. Please register again.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # OTP is valid - create the user account
+        user = NormalUser(
+            full_name=registration_data['full_name'],
+            email=registration_data['email'],
+            email_or_whatsapp=registration_data['email_or_whatsapp'],
+        )
+        
+        # Set password from stored hash
+        user.password_hash = registration_data['password_hash']
+        
+        # Mark as verified and active
+        user.is_email_verified = True
+        user.is_active = True
+        
+        # Save the user
+        user.save()
+        
+        # Create OTP record for tracking (optional, for audit purposes)
+        NormalUserOTP.objects.create(
+            user=user,
+            otp_type='email',
+            contact_info=email,
+            otp_code=otp_code,
+            expires_at=cached_expires_at,
+            is_used=True,
+            used_at=timezone.now()
+        )
+        
+        # Clean up cache
+        cache.delete(cache_key)
+        
+        return Response({
+            'message': 'Email verification successful! Your account is now active.',
+            'user_id': user.user_id,
+            'email': user.email,
+            'email_or_whatsapp': user.email_or_whatsapp,
+            'is_verified': user.is_verified(),
+            'is_active': user.is_active
+        }, status=status.HTTP_201_CREATED)
 
 
 class NormalUserLoginView(APIView):
@@ -470,10 +572,54 @@ class ResendOTPView(APIView):
     """Resend OTP for verification - Email only"""
     
     def post(self, request):
-        serializer = ResendOTPSerializer(data=request.data)
+        email = request.data.get('email', '').strip().lower()
+        otp_type = request.data.get('otp_type', 'email')
+        
+        if not email:
+            return Response({
+                'error': 'email is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if registration data exists in cache (pending registration)
+        if otp_type == 'email':
+            cache_key = f'normal_user_registration_{email}'
+            registration_data = cache.get(cache_key)
+            
+            if registration_data:
+                # Pending registration - regenerate OTP and update cache
+                otp_code = NormalUserOTP.generate_otp()
+                expires_at = timezone.now() + timedelta(minutes=10)
+                
+                # Update registration data with new OTP
+                registration_data['otp_code'] = otp_code
+                registration_data['otp_expires_at'] = expires_at.isoformat()
+                
+                # Update cache
+                cache.set(cache_key, registration_data, 15 * 60)
+                
+                # Send new OTP
+                if send_otp_email(email, otp_code):
+                    return Response({
+                        'message': 'New OTP sent to your email. Please check your inbox.',
+                        'email': email
+                    }, status=status.HTTP_200_OK)
+                else:
+                    return Response({
+                        'error': 'Failed to send OTP email. Please try again.'
+                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # Check if account already exists (old flow for existing accounts)
+        try:
+            user = NormalUser.objects.get(email=email)
+        except NormalUser.DoesNotExist:
+            return Response({
+                'error': 'No pending registration or account found with this email. Please register first.'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # For existing accounts, use serializer validation
+        serializer = ResendOTPSerializer(data={'email': email, 'otp_type': otp_type})
         if serializer.is_valid():
             user = serializer.validated_data['user']
-            otp_type = serializer.validated_data['otp_type']
             email = user.email
             
             # Generate new OTP

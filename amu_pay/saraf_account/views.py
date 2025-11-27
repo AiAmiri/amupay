@@ -11,6 +11,11 @@ from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.db import transaction
 from django.core.exceptions import ValidationError
+from django.core.cache import cache
+from django.utils import timezone
+from datetime import timedelta
+import json
+import base64
 
 from email_otp.models import EmailOTP
 from email_otp.utils import send_otp_email
@@ -202,71 +207,88 @@ class SarafAccountRegisterView(APIView):
         if license_no and SarafAccount.objects.filter(license_no=license_no).exists():
             return Response({'error': 'License number already exists.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        with transaction.atomic():
-            # Create SarafAccount object (do not save yet); set password first to validate strength
-            saraf = SarafAccount(
+        # Validate password strength before proceeding
+        try:
+            # Create a temporary SarafAccount object to validate password
+            temp_saraf = SarafAccount(
                 full_name=full_name,
-                exchange_name=exchange_name,
                 email=email,
                 email_or_whatsapp_number=email_or_whatsapp_number,
-                license_no=license_no or None,  # Allow None for optional license_no
                 amu_pay_code=amu_pay_code,
-                saraf_address=saraf_address,
-                saraf_location_google_map=saraf_location_google_map or None,  # Allow None for optional Google Maps link
                 province=province,
-                saraf_logo=saraf_logo,
-                saraf_logo_wallpeper=saraf_logo_wallpeper,
-                front_id_card=front_id_card,
-                back_id_card=back_id_card,
-                is_active=str(is_active_raw).lower() in ['1', 'true', 'yes'] if is_active_raw is not None else False,
             )
-            # Set password before first save so that if validation fails, nothing is written
-            try:
-                saraf.set_password(password)
-                # Model's save() method will validate and mark AmuPay code as used
-                saraf.save()
-                
-            except ValidationError as ve:
-                # Return model/password validation errors (no partial row persisted)
-                return Response({'error': 'Validation error', 'details': ve.message_dict if hasattr(ve, 'message_dict') else ve.messages}, status=status.HTTP_400_BAD_REQUEST)
+            temp_saraf.set_password(password)
+        except ValidationError as ve:
+            return Response({'error': 'Validation error', 'details': ve.message_dict if hasattr(ve, 'message_dict') else ve.messages}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Generate and send OTP for verification - ALWAYS to email (WhatsApp is profile only)
-            contact_info = saraf.email
-            otp_type = 'email'
-            
-            try:
-                # Generate OTP
-                otp = SarafOTP.generate_otp(saraf, otp_type, contact_info)
-                
-                # Send OTP to email
-                send_otp_email_saraf(contact_info, otp.otp_code)
-                
-                otp_message = f" Please check your email for OTP verification."
-            except Exception as e:
-                print(f"Warning: Failed to create/send OTP during registration: {str(e)}")
-                otp_message = f" Please check your email for OTP verification."
-
-        # Create JWT token directly for saraf without Django User
-        from rest_framework_simplejwt.tokens import RefreshToken
+        # Generate OTP code
+        import random
+        otp_code = str(random.randint(100000, 999999))
+        expires_at = timezone.now() + timedelta(minutes=10)
         
-        # Create a custom token payload
-        refresh = RefreshToken()
-        refresh['saraf_id'] = saraf.saraf_id
-        refresh['user_type'] = 'saraf'
-        refresh['user_id'] = saraf.saraf_id
-        refresh['full_name'] = saraf.full_name
-        refresh['exchange_name'] = saraf.exchange_name
-        refresh['email_or_whatsapp_number'] = saraf.email_or_whatsapp_number
+        # Store registration data in cache (NOT in database yet)
+        # Cache key: saraf_registration_{email}
+        registration_data = {
+            'full_name': full_name,
+            'exchange_name': exchange_name,
+            'email': email,
+            'email_or_whatsapp_number': email_or_whatsapp_number,
+            'license_no': license_no,
+            'amu_pay_code': amu_pay_code,
+            'saraf_address': saraf_address,
+            'saraf_location_google_map': saraf_location_google_map,
+            'province': province,
+            'password_hash': temp_saraf.password_hash,  # Store hashed password
+            'is_active': str(is_active_raw).lower() in ['1', 'true', 'yes'] if is_active_raw is not None else False,
+            'otp_code': otp_code,
+            'otp_expires_at': expires_at.isoformat(),
+            'created_at': timezone.now().isoformat(),
+        }
+        
+        # Handle file uploads - store file paths temporarily
+        # For files, we'll need to save them temporarily and move them after verification
+        file_data = {}
+        if saraf_logo:
+            # Save file temporarily
+            import os
+            from django.core.files.storage import default_storage
+            temp_path = f'temp_registrations/saraf_logo_{email}_{timezone.now().timestamp()}.{saraf_logo.name.split(".")[-1]}'
+            file_data['saraf_logo'] = default_storage.save(temp_path, saraf_logo)
+        if saraf_logo_wallpeper:
+            temp_path = f'temp_registrations/saraf_logo_wallpeper_{email}_{timezone.now().timestamp()}.{saraf_logo_wallpeper.name.split(".")[-1]}'
+            file_data['saraf_logo_wallpeper'] = default_storage.save(temp_path, saraf_logo_wallpeper)
+        if front_id_card:
+            temp_path = f'temp_registrations/front_id_card_{email}_{timezone.now().timestamp()}.{front_id_card.name.split(".")[-1]}'
+            file_data['front_id_card'] = default_storage.save(temp_path, front_id_card)
+        if back_id_card:
+            temp_path = f'temp_registrations/back_id_card_{email}_{timezone.now().timestamp()}.{back_id_card.name.split(".")[-1]}'
+            file_data['back_id_card'] = default_storage.save(temp_path, back_id_card)
+        
+        registration_data.update(file_data)
+        
+        # Store in cache for 15 minutes (longer than OTP expiration)
+        cache_key = f'saraf_registration_{email.lower()}'
+        cache.set(cache_key, registration_data, 15 * 60)  # 15 minutes
+        
+        # Send OTP to email
+        try:
+            send_otp_email_saraf(email, otp_code)
+            otp_message = " Please check your email for OTP verification."
+        except Exception as e:
+            logger.error(f"Failed to send OTP email: {str(e)}")
+            # Clean up cache if email sending fails
+            cache.delete(cache_key)
+            return Response({
+                'error': 'Failed to send verification email. Please try again.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
         return Response({
-            'message': f'Account created successfully.{otp_message}',
-            'saraf_id': saraf.saraf_id,
-            'contact_info': contact_info,
-            'otp_type': otp_type,
+            'message': f'Registration data received.{otp_message}',
+            'email': email,
             'otp_sent': True,
-            'refresh': str(refresh),
-            'access': str(refresh.access_token),
-        }, status=status.HTTP_201_CREATED)
+            'requires_verification': True,
+            'message_note': 'Your account will be created after OTP verification.'
+        }, status=status.HTTP_200_OK)
 
 
 class SarafAccountProtectedView(APIView):
@@ -1378,6 +1400,7 @@ class SarafOTPVerificationView(APIView):
     """Verify OTP for Saraf account - Email only"""
     permission_classes = [AllowAny]
     
+    @transaction.atomic
     def post(self, request):
         try:
             email = request.data.get('email', '').strip().lower()
@@ -1386,38 +1409,154 @@ class SarafOTPVerificationView(APIView):
             if not email or not otp_code:
                 return Response({'error': 'email and otp_code are required'}, status=status.HTTP_400_BAD_REQUEST)
             
-            try:
+            # Check if account already exists (shouldn't happen, but check anyway)
+            if SarafAccount.objects.filter(email=email).exists():
                 saraf_account = SarafAccount.objects.get(email=email)
-            except SarafAccount.DoesNotExist:
-                return Response({'error': 'Saraf account not found with this email'}, status=status.HTTP_404_NOT_FOUND)
+                # If account exists and is already verified, return success
+                if saraf_account.is_email_verified:
+                    return Response({
+                        'message': 'Account already verified.',
+                        'saraf_id': saraf_account.saraf_id,
+                        'email': saraf_account.email,
+                        'verified': True
+                    })
+                # If account exists but not verified, verify OTP from cache or existing OTP
+                otp = SarafOTP.verify_otp(saraf_account, 'email', email, otp_code)
+                if otp:
+                    otp.mark_as_used()
+                    saraf_account.update_verification_status(verified=True)
+                    if not saraf_account.is_active:
+                        saraf_account.is_active = True
+                        saraf_account.save(update_fields=['is_active'])
+                    return Response({
+                        'message': 'Email OTP verified successfully. Your account is now active.',
+                        'saraf_id': saraf_account.saraf_id,
+                        'email': saraf_account.email,
+                        'whatsapp_number': saraf_account.email_or_whatsapp_number,
+                        'verified': True,
+                        'is_active': saraf_account.is_active
+                    })
             
-            # Verify OTP (always email type)
-            otp = SarafOTP.verify_otp(saraf_account, 'email', email, otp_code)
+            # Get registration data from cache
+            cache_key = f'saraf_registration_{email}'
+            registration_data = cache.get(cache_key)
             
-            if otp:
-                otp.mark_as_used()
-                saraf_account.update_verification_status(verified=True)
-                
-                # Activate the account after successful verification
-                if not saraf_account.is_active:
-                    saraf_account.is_active = True
-                    saraf_account.save(update_fields=['is_active'])
-                
+            if not registration_data:
                 return Response({
-                    'message': 'Email OTP verified successfully. Your account is now active.',
-                    'saraf_id': saraf_account.saraf_id,
-                    'email': saraf_account.email,
-                    'whatsapp_number': saraf_account.email_or_whatsapp_number,
-                    'verified': True,
-                    'is_active': saraf_account.is_active
-                })
-            else:
-                return Response({
-                    'error': 'Invalid or expired OTP'
+                    'error': 'Registration session expired or not found. Please register again.'
                 }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Verify OTP code
+            cached_otp = registration_data.get('otp_code')
+            from datetime import datetime
+            cached_expires_at = datetime.fromisoformat(registration_data.get('otp_expires_at'))
+            
+            if cached_otp != otp_code:
+                return Response({
+                    'error': 'Invalid OTP code'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            if timezone.now() > cached_expires_at:
+                # Clean up expired registration
+                cache.delete(cache_key)
+                return Response({
+                    'error': 'OTP expired. Please register again.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # OTP is valid - create the account
+            from django.core.files.storage import default_storage
+            from django.core.files.base import ContentFile
+            
+            saraf = SarafAccount(
+                full_name=registration_data['full_name'],
+                exchange_name=registration_data.get('exchange_name'),
+                email=registration_data['email'],
+                email_or_whatsapp_number=registration_data['email_or_whatsapp_number'],
+                license_no=registration_data.get('license_no'),
+                amu_pay_code=registration_data['amu_pay_code'],
+                saraf_address=registration_data.get('saraf_address', ''),
+                saraf_location_google_map=registration_data.get('saraf_location_google_map'),
+                province=registration_data['province'],
+                is_active=registration_data.get('is_active', False),
+            )
+            
+            # Set password from stored hash
+            saraf.password_hash = registration_data['password_hash']
+            
+            # Handle file uploads - move from temp to permanent location
+            if registration_data.get('saraf_logo'):
+                temp_file = default_storage.open(registration_data['saraf_logo'], 'rb')
+                saraf.saraf_logo.save(
+                    f'saraf_photos/saraf_logo_{email}_{timezone.now().timestamp()}.{registration_data["saraf_logo"].split(".")[-1]}',
+                    temp_file,
+                    save=False
+                )
+                temp_file.close()
+                default_storage.delete(registration_data['saraf_logo'])
+            
+            if registration_data.get('saraf_logo_wallpeper'):
+                temp_file = default_storage.open(registration_data['saraf_logo_wallpeper'], 'rb')
+                saraf.saraf_logo_wallpeper.save(
+                    f'saraf_photos/saraf_logo_wallpeper_{email}_{timezone.now().timestamp()}.{registration_data["saraf_logo_wallpeper"].split(".")[-1]}',
+                    temp_file,
+                    save=False
+                )
+                temp_file.close()
+                default_storage.delete(registration_data['saraf_logo_wallpeper'])
+            
+            if registration_data.get('front_id_card'):
+                temp_file = default_storage.open(registration_data['front_id_card'], 'rb')
+                saraf.front_id_card.save(
+                    f'saraf_photos/front_id_card_{email}_{timezone.now().timestamp()}.{registration_data["front_id_card"].split(".")[-1]}',
+                    temp_file,
+                    save=False
+                )
+                temp_file.close()
+                default_storage.delete(registration_data['front_id_card'])
+            
+            if registration_data.get('back_id_card'):
+                temp_file = default_storage.open(registration_data['back_id_card'], 'rb')
+                saraf.back_id_card.save(
+                    f'saraf_photos/back_id_card_{email}_{timezone.now().timestamp()}.{registration_data["back_id_card"].split(".")[-1]}',
+                    temp_file,
+                    save=False
+                )
+                temp_file.close()
+                default_storage.delete(registration_data['back_id_card'])
+            
+            # Save the account
+            saraf.save()
+            
+            # Mark as verified and active
+            saraf.is_email_verified = True
+            saraf.is_active = True
+            saraf.save(update_fields=['is_email_verified', 'is_active'])
+            
+            # Clean up cache
+            cache.delete(cache_key)
+            
+            # Create JWT token
+            refresh = RefreshToken()
+            refresh['saraf_id'] = saraf.saraf_id
+            refresh['user_type'] = 'saraf'
+            refresh['user_id'] = saraf.saraf_id
+            refresh['full_name'] = saraf.full_name
+            refresh['exchange_name'] = saraf.exchange_name
+            refresh['email_or_whatsapp_number'] = saraf.email_or_whatsapp_number
+            
+            return Response({
+                'message': 'Email OTP verified successfully. Your account is now active.',
+                'saraf_id': saraf.saraf_id,
+                'email': saraf.email,
+                'whatsapp_number': saraf.email_or_whatsapp_number,
+                'verified': True,
+                'is_active': saraf.is_active,
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+            }, status=status.HTTP_201_CREATED)
                 
         except Exception as e:
-            logger.error(f"Error in SarafOTPVerificationView: {str(e)}")
+            logger.error(f"Error in SarafOTPVerificationView: {str(e)}", exc_info=True)
             return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -1432,12 +1571,46 @@ class SarafResendOTPView(APIView):
             if not email:
                 return Response({'error': 'email is required'}, status=status.HTTP_400_BAD_REQUEST)
             
+            # Check if registration data exists in cache (pending registration)
+            cache_key = f'saraf_registration_{email}'
+            registration_data = cache.get(cache_key)
+            
+            if registration_data:
+                # Pending registration - regenerate OTP and update cache
+                import random
+                otp_code = str(random.randint(100000, 999999))
+                expires_at = timezone.now() + timedelta(minutes=10)
+                
+                # Update registration data with new OTP
+                registration_data['otp_code'] = otp_code
+                registration_data['otp_expires_at'] = expires_at.isoformat()
+                
+                # Update cache
+                cache.set(cache_key, registration_data, 15 * 60)
+                
+                # Send new OTP
+                try:
+                    send_otp_email_saraf(email, otp_code)
+                    return Response({
+                        'message': 'New OTP sent to your email. Please check your inbox.',
+                        'email': email,
+                        'otp_type': 'email'
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to send OTP email: {str(e)}")
+                    return Response({
+                        'error': 'Failed to send OTP email. Please try again.'
+                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            # Check if account already exists (old flow for existing accounts)
             try:
                 saraf_account = SarafAccount.objects.get(email=email)
             except SarafAccount.DoesNotExist:
-                return Response({'error': 'Saraf account not found with this email'}, status=status.HTTP_404_NOT_FOUND)
+                return Response({
+                    'error': 'No pending registration or account found with this email. Please register first.'
+                }, status=status.HTTP_404_NOT_FOUND)
             
-            # Generate new OTP (always email)
+            # Generate new OTP for existing account (always email)
             otp = SarafOTP.generate_otp(saraf_account, 'email', email)
             
             # Send OTP to email
@@ -1450,7 +1623,7 @@ class SarafResendOTPView(APIView):
             })
             
         except Exception as e:
-            logger.error(f"Error in SarafResendOTPView: {str(e)}")
+            logger.error(f"Error in SarafResendOTPView: {str(e)}", exc_info=True)
             return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
