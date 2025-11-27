@@ -447,6 +447,10 @@ class ExternalReceiveHawalaView(APIView):
             if serializer.is_valid():
                 hawala = serializer.save()
                 
+                # Update saraf balance - receiving external hawala decreases balance
+                # External receive hawalas are created with status='received', so update balance immediately
+                self._update_saraf_balance(saraf_account, hawala.currency, hawala.amount, 'withdrawal', 'hawala_external_receive', employee)
+                
                 return Response({
                     'message': 'External hawala transaction created successfully',
                     'hawala': HawalaTransactionSerializer(hawala, context={'saraf_account': saraf_account}).data
@@ -462,6 +466,61 @@ class ExternalReceiveHawalaView(APIView):
                 'error': 'Failed to create external hawala transaction',
                 'details': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def _update_saraf_balance(self, saraf_account, currency, amount, transaction_type, description, employee=None):
+        """Helper method to update saraf balance"""
+        from django.db import transaction as db_transaction
+        from decimal import Decimal
+        
+        try:
+            from saraf_balance.models import SarafBalance
+            from transaction.models import Transaction
+            
+            with db_transaction.atomic():
+                # Get or create balance record
+                balance, created = SarafBalance.get_or_create_balance(
+                    saraf_account,
+                    currency
+                )
+                
+                # Determine performer information
+                if employee:
+                    performer_user_id = employee.employee_id
+                    performer_user_type = 'employee'
+                    performer_full_name = employee.full_name
+                    performer_employee_id = employee.employee_id
+                    performer_employee_name = employee.full_name
+                else:
+                    performer_user_id = saraf_account.saraf_id
+                    performer_user_type = 'saraf'
+                    performer_full_name = saraf_account.full_name
+                    performer_employee_id = None
+                    performer_employee_name = None
+                
+                # Create transaction - Transaction.save() will update the balance and calculate balance_before/balance_after
+                # We provide placeholder values for required fields; save() will recalculate them correctly
+                transaction = Transaction(
+                    saraf_account=saraf_account,
+                    currency=currency,
+                    transaction_type=transaction_type,  # 'deposit' or 'withdrawal'
+                    amount=amount,
+                    performer_user_id=performer_user_id,
+                    performer_user_type=performer_user_type,
+                    performer_full_name=performer_full_name,
+                    performer_employee_id=performer_employee_id,
+                    performer_employee_name=performer_employee_name,
+                    description=f"Hawala transaction: {description}",
+                    balance_before=Decimal('0.00'),  # Placeholder, will be recalculated in save()
+                    balance_after=Decimal('0.00')  # Placeholder, will be recalculated in save()
+                )
+                transaction.save()  # This will update the balance and set correct balance_before/balance_after
+                
+        except Exception as e:
+            # Log error and re-raise to ensure transaction rollback
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to update saraf balance: {str(e)}")
+            raise
 
 
 class HawalaHistoryView(APIView):
