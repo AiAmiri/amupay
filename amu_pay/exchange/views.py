@@ -1,7 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
@@ -716,3 +716,102 @@ class ExchangeTransactionCreateWithBalanceView(APIView):
         if exchange_transaction.buy_amount > 0:
             buy_balance, _ = SarafBalance.get_or_create_balance(saraf_account, buy_currency)
             buy_balance.update_balance(exchange_transaction.buy_amount, 'deposit')
+
+
+class CustomerExchangeListView(APIView):
+    """
+    Public endpoint to get all exchange transactions for a customer by phone number
+    """
+    permission_classes = [AllowAny]
+    
+    def get(self, request):
+        """Get all exchange transactions for a customer based on phone number"""
+        try:
+            # Get phone number from query parameters
+            phone = request.query_params.get('phone', '').strip()
+            
+            if not phone:
+                return Response({
+                    'error': 'Phone number is required',
+                    'message': 'Please provide a phone number as a query parameter (e.g., ?phone=0123456789)'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Validate phone number format (10 digits starting with 0)
+            import re
+            if not re.match(r'^0\d{9}$', phone):
+                return Response({
+                    'error': 'Invalid phone number format',
+                    'message': 'Phone number must be 10 digits and start with 0 (e.g., 0123456789)'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Import SarafCustomerAccount model
+            from saraf_create_accounts.models import SarafCustomerAccount
+            
+            # Find all customer accounts with this phone number
+            customer_accounts = SarafCustomerAccount.objects.filter(
+                phone=phone,
+                is_active=True
+            ).select_related('saraf_account')
+            
+            if not customer_accounts.exists():
+                return Response({
+                    'message': 'No customer accounts found for this phone number',
+                    'phone': phone,
+                    'exchanges': [],
+                    'total_count': 0
+                }, status=status.HTTP_200_OK)
+            
+            # Get all exchange transactions for these customer accounts
+            exchange_transactions = ExchangeTransaction.objects.filter(
+                customer_account__in=customer_accounts
+            ).select_related(
+                'customer_account',
+                'saraf_account',
+                'performed_by_saraf',
+                'performed_by_employee'
+            ).order_by('-transaction_date', '-created_at')
+            
+            # Pagination
+            page = int(request.query_params.get('page', 1))
+            page_size = int(request.query_params.get('page_size', 20))
+            start_index = (page - 1) * page_size
+            end_index = start_index + page_size
+            
+            total_count = exchange_transactions.count()
+            transactions_page = exchange_transactions[start_index:end_index]
+            
+            # Serialize the transactions
+            serializer = ExchangeTransactionSerializer(transactions_page, many=True)
+            
+            # Get customer account information
+            customer_info = []
+            for account in customer_accounts:
+                customer_info.append({
+                    'account_id': account.account_id,
+                    'account_number': account.account_number,
+                    'full_name': account.full_name,
+                    'account_type': account.account_type,
+                    'phone': account.phone,
+                    'saraf_name': account.saraf_account.full_name if account.saraf_account else None,
+                    'saraf_id': account.saraf_account.saraf_id if account.saraf_account else None
+                })
+            
+            return Response({
+                'message': 'Exchange transactions retrieved successfully',
+                'phone': phone,
+                'customer_accounts': customer_info,
+                'exchanges': serializer.data,
+                'pagination': {
+                    'page': page,
+                    'page_size': page_size,
+                    'total_count': total_count,
+                    'total_pages': (total_count + page_size - 1) // page_size if total_count > 0 else 0
+                }
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"Error getting customer exchange transactions: {str(e)}")
+            return Response({
+                'error': 'Error getting exchange transactions',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
