@@ -1,7 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
@@ -307,16 +307,8 @@ class ExchangeTransactionCreateView(APIView):
                     performed_by_employee=SarafEmployee.objects.get(employee_id=user_info['employee_id']) if user_info.get('employee_id') else None
                 )
                 
-                # Get employee if exists
-                employee = None
-                if user_info.get('employee_id'):
-                    try:
-                        employee = SarafEmployee.objects.get(employee_id=user_info['employee_id'])
-                    except SarafEmployee.DoesNotExist:
-                        pass
-                
                 # Update balances based on transaction type
-                self._update_balances_for_exchange(exchange_transaction, saraf_account, employee)
+                self._update_balances_for_exchange(exchange_transaction, saraf_account)
                 
                 # Log the action
                 ActionLog.objects.create(
@@ -343,10 +335,8 @@ class ExchangeTransactionCreateView(APIView):
                 'details': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
-    def _update_balances_for_exchange(self, exchange_transaction, saraf_account, employee=None):
+    def _update_balances_for_exchange(self, exchange_transaction, saraf_account):
         """Update balances based on transaction type"""
-        from django.db import transaction as db_transaction
-        
         try:
             from saraf_balance.models import SarafBalance
             from saraf_create_accounts.models import CustomerBalance
@@ -360,50 +350,48 @@ class ExchangeTransactionCreateView(APIView):
             sell_currency = Currency.objects.get(currency_code=exchange_transaction.sell_currency)
             buy_currency = Currency.objects.get(currency_code=exchange_transaction.buy_currency)
             
-            with db_transaction.atomic():
-                if transaction_type == 'customer' and customer_account:
-                    # Customer transaction: Update customer balance and saraf balance
-                    # From customer's perspective: saraf sells = customer buys (deposit), saraf buys = customer sells (withdrawal)
-                    self._update_customer_and_saraf_balances(
-                        customer_account, saraf_account, 
-                        sell_currency, exchange_transaction.sell_amount, 'deposit',
-                        buy_currency, exchange_transaction.buy_amount, 'withdrawal',
-                        exchange_transaction, employee
-                    )
-                    
-                elif transaction_type == 'exchanger' and customer_account:
-                    # Exchanger transaction: Update exchanger balance and saraf balance
-                    # From exchanger's perspective: saraf sells = exchanger buys (deposit), saraf buys = exchanger sells (withdrawal)
-                    self._update_customer_and_saraf_balances(
-                        customer_account, saraf_account,
-                        sell_currency, exchange_transaction.sell_amount, 'deposit',
-                        buy_currency, exchange_transaction.buy_amount, 'withdrawal',
-                        exchange_transaction, employee
-                    )
-                    
-                elif transaction_type == 'person':
-                    # Person transaction: Update only saraf balance
-                    self._update_saraf_balance_only(
-                        saraf_account, sell_currency, exchange_transaction.sell_amount, 'withdrawal',
-                        buy_currency, exchange_transaction.buy_amount, 'deposit',
-                        exchange_transaction, employee
-                    )
-                    
+            if transaction_type == 'customer' and customer_account:
+                # Customer transaction: Update customer balance and saraf balance
+                # From customer's perspective: saraf sells = customer buys (deposit), saraf buys = customer sells (withdrawal)
+                self._update_customer_and_saraf_balances(
+                    customer_account, saraf_account, 
+                    sell_currency, exchange_transaction.sell_amount, 'deposit',
+                    buy_currency, exchange_transaction.buy_amount, 'withdrawal',
+                    exchange_transaction
+                )
+                
+            elif transaction_type == 'exchanger' and customer_account:
+                # Exchanger transaction: Update exchanger balance and saraf balance
+                # From exchanger's perspective: saraf sells = exchanger buys (deposit), saraf buys = exchanger sells (withdrawal)
+                self._update_customer_and_saraf_balances(
+                    customer_account, saraf_account,
+                    sell_currency, exchange_transaction.sell_amount, 'deposit',
+                    buy_currency, exchange_transaction.buy_amount, 'withdrawal',
+                    exchange_transaction
+                )
+                
+            elif transaction_type == 'person':
+                # Person transaction: Update only saraf balance
+                self._update_saraf_balance_only(
+                    saraf_account, sell_currency, exchange_transaction.sell_amount, 'withdrawal',
+                    buy_currency, exchange_transaction.buy_amount, 'deposit',
+                    exchange_transaction
+                )
+                
         except Exception as e:
             import logging
             logger = logging.getLogger(__name__)
             logger.error(f"Error updating balances for exchange transaction: {str(e)}")
-            raise  # Re-raise to ensure transaction rollback
+            # Don't fail the transaction, just log the error
     
     def _update_customer_and_saraf_balances(self, customer_account, saraf_account, 
                                           sell_currency, sell_amount, sell_type,
                                           buy_currency, buy_amount, buy_type,
-                                          exchange_transaction, employee=None):
+                                          exchange_transaction):
         """Update both customer and saraf balances"""
         from saraf_balance.models import SarafBalance
         from saraf_create_accounts.models import CustomerBalance
         from transaction.models import Transaction
-        from decimal import Decimal
         
         # Update customer balance for sell currency (deposit - customer buys what saraf sells)
         customer_balance_sell, _ = CustomerBalance.get_or_create_balance(customer_account, sell_currency)
@@ -413,120 +401,81 @@ class ExchangeTransactionCreateView(APIView):
         customer_balance_buy, _ = CustomerBalance.get_or_create_balance(customer_account, buy_currency)
         customer_balance_buy.update_balance(buy_amount, buy_type)
         
-        # Determine performer information for saraf transactions
-        if employee:
-            performer_user_id = employee.employee_id
-            performer_user_type = 'employee'
-            performer_full_name = employee.full_name
-            performer_employee_id = employee.employee_id
-            performer_employee_name = employee.full_name
-        else:
-            performer_user_id = saraf_account.saraf_id
-            performer_user_type = 'saraf'
-            performer_full_name = saraf_account.full_name
-            performer_employee_id = None
-            performer_employee_name = None
-        
         # Update saraf balance for sell currency (withdrawal - saraf sells)
-        # Use Transaction.save() to update balance - don't call update_balance() directly
         saraf_balance_sell, _ = SarafBalance.get_or_create_balance(saraf_account, sell_currency)
-        
-        transaction_sell = Transaction(
-            saraf_account=saraf_account,
-            currency=sell_currency,
-            transaction_type='withdrawal',  # Saraf sells = withdrawal
-            amount=sell_amount,
-            performer_user_id=performer_user_id,
-            performer_user_type=performer_user_type,
-            performer_full_name=performer_full_name,
-            performer_employee_id=performer_employee_id,
-            performer_employee_name=performer_employee_name,
-            description=f"Exchange transaction: {exchange_transaction.name} - Sell {sell_amount} {sell_currency.currency_code}",
-            balance_before=Decimal('0.00'),  # Placeholder, will be recalculated in save()
-            balance_after=Decimal('0.00')  # Placeholder, will be recalculated in save()
-        )
-        transaction_sell.save()  # This will update the balance
+        saraf_balance_sell.update_balance(sell_amount, 'withdrawal')
         
         # Update saraf balance for buy currency (deposit - saraf buys)
-        # Use Transaction.save() to update balance - don't call update_balance() directly
         saraf_balance_buy, _ = SarafBalance.get_or_create_balance(saraf_account, buy_currency)
+        saraf_balance_buy.update_balance(buy_amount, 'deposit')
         
-        transaction_buy = Transaction(
+        # Log transactions
+        Transaction.objects.create(
+            transaction_type='exchange_sell',
+            amount=sell_amount,
+            currency=sell_currency,
             saraf_account=saraf_account,
-            currency=buy_currency,
-            transaction_type='deposit',  # Saraf buys = deposit
-            amount=buy_amount,
-            performer_user_id=performer_user_id,
-            performer_user_type=performer_user_type,
-            performer_full_name=performer_full_name,
-            performer_employee_id=performer_employee_id,
-            performer_employee_name=performer_employee_name,
-            description=f"Exchange transaction: {exchange_transaction.name} - Buy {buy_amount} {buy_currency.currency_code}",
-            balance_before=Decimal('0.00'),  # Placeholder, will be recalculated in save()
-            balance_after=Decimal('0.00')  # Placeholder, will be recalculated in save()
+            performer_user_id=saraf_account.saraf_id,
+            performer_user_type='saraf',
+            performer_full_name=saraf_account.full_name,
+            performer_employee_id=None,
+            performer_employee_name=None,
+            description=f"Exchange transaction: {exchange_transaction.name} - Sell {sell_amount} {sell_currency.currency_code}"
         )
-        transaction_buy.save()  # This will update the balance
+        
+        Transaction.objects.create(
+            transaction_type='exchange_buy',
+            amount=buy_amount,
+            currency=buy_currency,
+            saraf_account=saraf_account,
+            performer_user_id=saraf_account.saraf_id,
+            performer_user_type='saraf',
+            performer_full_name=saraf_account.full_name,
+            performer_employee_id=None,
+            performer_employee_name=None,
+            description=f"Exchange transaction: {exchange_transaction.name} - Buy {buy_amount} {buy_currency.currency_code}"
+        )
     
     def _update_saraf_balance_only(self, saraf_account, sell_currency, sell_amount, sell_type,
-                                 buy_currency, buy_amount, buy_type, exchange_transaction, employee=None):
+                                 buy_currency, buy_amount, buy_type, exchange_transaction):
         """Update only saraf balance for person transactions"""
         from saraf_balance.models import SarafBalance
         from transaction.models import Transaction
-        from decimal import Decimal
-        
-        # Determine performer information
-        if employee:
-            performer_user_id = employee.employee_id
-            performer_user_type = 'employee'
-            performer_full_name = employee.full_name
-            performer_employee_id = employee.employee_id
-            performer_employee_name = employee.full_name
-        else:
-            performer_user_id = saraf_account.saraf_id
-            performer_user_type = 'saraf'
-            performer_full_name = saraf_account.full_name
-            performer_employee_id = None
-            performer_employee_name = None
         
         # Update saraf balance for sell currency (saraf sells - withdrawal)
-        # Use Transaction.save() to update balance - don't call update_balance() directly
         saraf_balance_sell, _ = SarafBalance.get_or_create_balance(saraf_account, sell_currency)
-        
-        transaction_sell = Transaction(
-            saraf_account=saraf_account,
-            currency=sell_currency,
-            transaction_type=sell_type,  # 'withdrawal' for selling
-            amount=sell_amount,
-            performer_user_id=performer_user_id,
-            performer_user_type=performer_user_type,
-            performer_full_name=performer_full_name,
-            performer_employee_id=performer_employee_id,
-            performer_employee_name=performer_employee_name,
-            description=f"Person exchange transaction: {exchange_transaction.name} - Sell {sell_amount} {sell_currency.currency_code}",
-            balance_before=Decimal('0.00'),  # Placeholder, will be recalculated in save()
-            balance_after=Decimal('0.00')  # Placeholder, will be recalculated in save()
-        )
-        transaction_sell.save()  # This will update the balance
+        saraf_balance_sell.update_balance(sell_amount, sell_type)
         
         # Update saraf balance for buy currency (saraf buys - deposit)
-        # Use Transaction.save() to update balance - don't call update_balance() directly
         saraf_balance_buy, _ = SarafBalance.get_or_create_balance(saraf_account, buy_currency)
+        saraf_balance_buy.update_balance(buy_amount, buy_type)
         
-        transaction_buy = Transaction(
+        # Log transactions
+        Transaction.objects.create(
+            transaction_type='exchange_person_sell',
+            amount=sell_amount,
+            currency=sell_currency,
             saraf_account=saraf_account,
-            currency=buy_currency,
-            transaction_type=buy_type,  # 'deposit' for buying
-            amount=buy_amount,
-            performer_user_id=performer_user_id,
-            performer_user_type=performer_user_type,
-            performer_full_name=performer_full_name,
-            performer_employee_id=performer_employee_id,
-            performer_employee_name=performer_employee_name,
-            description=f"Person exchange transaction: {exchange_transaction.name} - Buy {buy_amount} {buy_currency.currency_code}",
-            balance_before=Decimal('0.00'),  # Placeholder, will be recalculated in save()
-            balance_after=Decimal('0.00')  # Placeholder, will be recalculated in save()
+            performer_user_id=saraf_account.saraf_id,
+            performer_user_type='saraf',
+            performer_full_name=saraf_account.full_name,
+            performer_employee_id=None,
+            performer_employee_name=None,
+            description=f"Person exchange transaction: {exchange_transaction.name} - Sell {sell_amount} {sell_currency.currency_code}"
         )
-        transaction_buy.save()  # This will update the balance
+        
+        Transaction.objects.create(
+            transaction_type='exchange_person_buy',
+            amount=buy_amount,
+            currency=buy_currency,
+            saraf_account=saraf_account,
+            performer_user_id=saraf_account.saraf_id,
+            performer_user_type='saraf',
+            performer_full_name=saraf_account.full_name,
+            performer_employee_id=None,
+            performer_employee_name=None,
+            description=f"Person exchange transaction: {exchange_transaction.name} - Buy {buy_amount} {buy_currency.currency_code}"
+        )
 
 
 class ExchangeTransactionDetailView(APIView):
@@ -767,102 +716,3 @@ class ExchangeTransactionCreateWithBalanceView(APIView):
         if exchange_transaction.buy_amount > 0:
             buy_balance, _ = SarafBalance.get_or_create_balance(saraf_account, buy_currency)
             buy_balance.update_balance(exchange_transaction.buy_amount, 'deposit')
-
-
-class CustomerExchangeListView(APIView):
-    """
-    Public endpoint to get all exchange transactions for a customer by phone number
-    """
-    permission_classes = [AllowAny]
-    
-    def get(self, request):
-        """Get all exchange transactions for a customer based on phone number"""
-        try:
-            # Get phone number from query parameters
-            phone = request.query_params.get('phone', '').strip()
-            
-            if not phone:
-                return Response({
-                    'error': 'Phone number is required',
-                    'message': 'Please provide a phone number as a query parameter (e.g., ?phone=0123456789)'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Validate phone number format (10 digits starting with 0)
-            import re
-            if not re.match(r'^0\d{9}$', phone):
-                return Response({
-                    'error': 'Invalid phone number format',
-                    'message': 'Phone number must be 10 digits and start with 0 (e.g., 0123456789)'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Import SarafCustomerAccount model
-            from saraf_create_accounts.models import SarafCustomerAccount
-            
-            # Find all customer accounts with this phone number
-            customer_accounts = SarafCustomerAccount.objects.filter(
-                phone=phone,
-                is_active=True
-            ).select_related('saraf_account')
-            
-            if not customer_accounts.exists():
-                return Response({
-                    'message': 'No customer accounts found for this phone number',
-                    'phone': phone,
-                    'exchanges': [],
-                    'total_count': 0
-                }, status=status.HTTP_200_OK)
-            
-            # Get all exchange transactions for these customer accounts
-            exchange_transactions = ExchangeTransaction.objects.filter(
-                customer_account__in=customer_accounts
-            ).select_related(
-                'customer_account',
-                'saraf_account',
-                'performed_by_saraf',
-                'performed_by_employee'
-            ).order_by('-transaction_date', '-created_at')
-            
-            # Pagination
-            page = int(request.query_params.get('page', 1))
-            page_size = int(request.query_params.get('page_size', 20))
-            start_index = (page - 1) * page_size
-            end_index = start_index + page_size
-            
-            total_count = exchange_transactions.count()
-            transactions_page = exchange_transactions[start_index:end_index]
-            
-            # Serialize the transactions
-            serializer = ExchangeTransactionSerializer(transactions_page, many=True)
-            
-            # Get customer account information
-            customer_info = []
-            for account in customer_accounts:
-                customer_info.append({
-                    'account_id': account.account_id,
-                    'account_number': account.account_number,
-                    'full_name': account.full_name,
-                    'account_type': account.account_type,
-                    'phone': account.phone,
-                    'saraf_name': account.saraf_account.full_name if account.saraf_account else None,
-                    'saraf_id': account.saraf_account.saraf_id if account.saraf_account else None
-                })
-            
-            return Response({
-                'message': 'Exchange transactions retrieved successfully',
-                'phone': phone,
-                'customer_accounts': customer_info,
-                'exchanges': serializer.data,
-                'pagination': {
-                    'page': page,
-                    'page_size': page_size,
-                    'total_count': total_count,
-                    'total_pages': (total_count + page_size - 1) // page_size if total_count > 0 else 0
-                }
-            }, status=status.HTTP_200_OK)
-            
-        except Exception as e:
-            logger.error(f"Error getting customer exchange transactions: {str(e)}")
-            return Response({
-                'error': 'Error getting exchange transactions',
-                'details': str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

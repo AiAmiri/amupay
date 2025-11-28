@@ -52,32 +52,46 @@ class NormalUserRegistrationSerializer(serializers.ModelSerializer):
         return value
     
     def validate(self, attrs):
-        """Validate that passwords match and email/WhatsApp don't already exist"""
+        """Validate that passwords match and email/WhatsApp don't already exist (or delete unverified accounts)"""
         if attrs['password'] != attrs['repeat_password']:
             raise serializers.ValidationError("Passwords do not match")
         
         email = attrs['email']
         whatsapp_number = attrs['email_or_whatsapp']
         
-        # Check if email already exists
-        if NormalUser.objects.filter(email=email).exists():
-            raise serializers.ValidationError({"email": "An account with this email already exists"})
+        # Check if email already exists - allow re-registration if not verified
+        existing_user_email = NormalUser.objects.filter(email=email).first()
+        if existing_user_email:
+            if not existing_user_email.is_email_verified:
+                # Delete unverified account to allow re-registration
+                existing_user_email.delete()
+            else:
+                raise serializers.ValidationError({"email": "An account with this email already exists and is verified"})
         
-        # Check if WhatsApp number already exists
-        if NormalUser.objects.filter(email_or_whatsapp=whatsapp_number).exists():
-            raise serializers.ValidationError({"email_or_whatsapp": "An account with this WhatsApp number already exists"})
+        # Check if WhatsApp number already exists - allow re-registration if not verified
+        existing_user_whatsapp = NormalUser.objects.filter(email_or_whatsapp=whatsapp_number).first()
+        if existing_user_whatsapp:
+            if not existing_user_whatsapp.is_email_verified:
+                # Delete unverified account to allow re-registration
+                existing_user_whatsapp.delete()
+            else:
+                raise serializers.ValidationError({"email_or_whatsapp": "An account with this WhatsApp number already exists and is verified"})
         
         return attrs
     
     def create(self, validated_data):
-        """Create a new normal user with both email and WhatsApp"""
+        """Create a new normal user with both email and WhatsApp - set as inactive until OTP verification"""
         password = validated_data.pop('password')
         validated_data.pop('repeat_password')  # Remove repeat_password
         
         # email and email_or_whatsapp are already in validated_data with correct field names
         
-        # Create user
-        user = NormalUser.objects.create(**validated_data)
+        # Create user as inactive and unverified - will be activated after OTP verification
+        user = NormalUser.objects.create(
+            **validated_data,
+            is_active=False,  # Will be activated after OTP verification
+            is_email_verified=False  # Will be set to True after OTP verification
+        )
         user.set_password(password)
         
         return user
